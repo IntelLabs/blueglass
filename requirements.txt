@@ -1,8 +1,4 @@
-pip==23.3
 setuptools
-torch
-torchvision
-torchaudio --index-url https://download.pytorch.org/whl/cu124
 omegaconf
 cloudpickle
 fvcore
@@ -23,7 +19,7 @@ simple_parsing
 natsort
 einops
 scipy
-opencv-python
+opencv-python-headless
 hydra-core
 SciencePlots
 google-genai
@@ -35,3 +31,4 @@ umap-learn
 uuid
 plotly
 polars
+nvtx

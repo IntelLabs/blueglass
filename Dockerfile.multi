@@ -1,0 +1,145 @@
+# Multi-version Dockerfile for BlueGlass
+# Supports multiple CUDA and PyTorch versions via build arguments
+
+ARG CUDA_VERSION=12.6.3
+ARG CUDA_IMAGE_TAG=12.6.3-cudnn-devel-ubuntu22.04
+ARG PYTORCH_VERSION=2.5.1
+ARG PYTORCH_CUDA_VERSION=cu126
+
+FROM nvidia/cuda:${CUDA_IMAGE_TAG}
+
+# Build arguments (can be overridden during build)
+ARG CUDA_VERSION
+ARG PYTORCH_VERSION
+ARG PYTORCH_CUDA_VERSION
+ARG PYTHON_VERSION=3.11
+
+# Store versions as environment variables for runtime access
+ENV CUDA_VERSION=${CUDA_VERSION}
+ENV PYTORCH_VERSION=${PYTORCH_VERSION}
+ENV PYTORCH_CUDA_VERSION=${PYTORCH_CUDA_VERSION}
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Europe/Berlin
+
+# Needed to compile custom PyTorch extensions with CUDA support
+ENV FORCE_CUDA=1
+
+# Set CUDA environment variables - dynamically set based on CUDA version
+ENV CUDA_HOME=/usr/local/cuda
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+
+# Set CUDA paths based on version
+ENV PATH=/usr/local/cuda-${CUDA_VERSION}/bin${PATH:+:${PATH}}
+ENV LD_LIBRARY_PATH=/usr/local/cuda-${CUDA_VERSION}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+
+# Add version info to image
+LABEL cuda.version=${CUDA_VERSION}
+LABEL pytorch.version=${PYTORCH_VERSION}
+LABEL python.version=${PYTHON_VERSION}
+LABEL maintainer="BlueGlass Team"
+LABEL description="BlueGlass with CUDA ${CUDA_VERSION}, PyTorch ${PYTORCH_VERSION}, Python ${PYTHON_VERSION}"
+
+# Blueglass project environment variables
+ENV PROJECT_ROOT=/home/tools/blueglass
+ENV BENCHMARK_ROOT=/home/tools/blueglass/blueglass/modeling/modelstore
+ENV THIRD_PARTY_ROOT=/home/tools/blueglass/blueglass/third_party
+
+# Install system dependencies
+RUN apt-get update && apt-get install --no-install-recommends -y git curl wget \
+      software-properties-common ca-certificates \
+      environment-modules libgeos-dev build-essential cmake \
+      vim nano tree less emacs tmux gdb && rm -rf /var/lib/apt/lists/*
+
+# Install specified Python version from deadsnakes PPA
+RUN add-apt-repository ppa:deadsnakes/ppa && apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python${PYTHON_VERSION} python${PYTHON_VERSION}-dev \
+    python${PYTHON_VERSION}-distutils python${PYTHON_VERSION}-venv && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /home/tools
+
+# Create virtual environment with specified Python version
+RUN python${PYTHON_VERSION} -m venv /home/tools/env && . /home/tools/env/bin/activate \
+    && python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install PyTorch with specified version and CUDA support
+RUN . /home/tools/env/bin/activate && \
+    python -m pip install --no-cache-dir \
+    torch==${PYTORCH_VERSION} torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_VERSION}
+
+# Clone BlueGlass repository
+ARG blueglass_repo=https://github.com/IntelLabs/blueglass
+ARG blueglass_branch=main
+
+RUN git clone --depth 1 --branch ${blueglass_branch} ${blueglass_repo} ${PROJECT_ROOT}
+
+# Install requirements
+RUN . /home/tools/env/bin/activate && python3 -m pip install --no-cache-dir -r ${PROJECT_ROOT}/requirements.txt
+
+# Install COCO API
+RUN git clone --depth 1 --branch master https://github.com/ppwwyyxx/cocoapi.git /home/tools/cocoapi
+RUN . /home/tools/env/bin/activate && python3 -m pip install --no-cache-dir /home/tools/cocoapi/PythonAPI
+
+# Install LVIS API
+RUN git clone --depth 1 --branch master https://github.com/lvis-dataset/lvis-api.git ${THIRD_PARTY_ROOT}/lvis
+RUN . /home/tools/env/bin/activate && python3 -m pip install --no-cache-dir ${THIRD_PARTY_ROOT}/lvis
+
+# Install Scalabel
+RUN . /home/tools/env/bin/activate && python3 -m pip install --no-cache-dir ${THIRD_PARTY_ROOT}/scalabel
+
+# Prepare GenerateU environment
+RUN set -e \
+    && echo "Prepare GenerateU environment." \
+    && rm -rf "$BENCHMARK_ROOT/generateu/projects/DDETRS/ddetrs/models/deformable_detr/ops/MultiScaleDeformableAttention.egg-info" \
+    && rm -rf "$BENCHMARK_ROOT/generateu/projects/DDETRS/ddetrs/models/deformable_detr/ops/build" \
+    && rm -rf "$BENCHMARK_ROOT/generateu/projects/DDETRS/ddetrs/models/deformable_detr/ops/dist" \
+    && rm -rf "$BENCHMARK_ROOT/generateu/build" \
+    && rm -rf "$BENCHMARK_ROOT/generateu/detectron2.egg-info" \
+    && . /home/tools/env/bin/activate \
+    && pip install --no-cache-dir "$BENCHMARK_ROOT/generateu" \
+    && cd "$BENCHMARK_ROOT/generateu/projects/DDETRS/ddetrs/models/deformable_detr/ops/" \
+    && bash make.sh \
+    && cd "$PROJECT_ROOT" \
+    && echo "Done."
+
+# Prepare Grounding DINO environment
+RUN set -e \
+    && echo "Prepare Grounding DINO environment." \
+    && rm -rf "${BENCHMARK_ROOT}/grounding_dino/build" \
+    && rm -rf "${BENCHMARK_ROOT}/grounding_dino/groundingdino.egg-info" \
+    && . /home/tools/env/bin/activate \
+    && pip install --no-cache-dir "${BENCHMARK_ROOT}/grounding_dino" \
+    && echo "Done."
+
+# Prepare MMDET environment
+RUN . /home/tools/env/bin/activate && python3 -m pip install --no-cache-dir openmim && mim install mmengine mmcv==2.2.0
+
+RUN git clone --depth 1 --branch main https://github.com/open-mmlab/mmdetection.git ${THIRD_PARTY_ROOT}/mmdet && \
+    sed -i 's/mmcv_version < digit_version(mmcv_maximum_version))/mmcv_version <= digit_version(mmcv_maximum_version))/' "${THIRD_PARTY_ROOT}/mmdet/mmdet/__init__.py"
+RUN . /home/tools/env/bin/activate && python3 -m pip install --no-cache-dir ${THIRD_PARTY_ROOT}/mmdet
+
+# Install blueglass
+RUN . /home/tools/env/bin/activate && python3 -m pip install --no-cache-dir -e /home/tools/blueglass
+
+# Fix OpenCV installation
+RUN . /home/tools/env/bin/activate && \
+    python3 -m pip uninstall -y opencv-python opencv-python-headless && \
+    python3 -m pip install --no-cache-dir opencv-python-headless
+
+# Add environment activation to bashrc
+RUN echo "source /home/tools/env/bin/activate" >> /root/.bashrc
+
+# Add version info script
+RUN echo '#!/bin/bash\necho "=== BlueGlass Container Info ==="\necho "CUDA Version: $CUDA_VERSION"\necho "PyTorch Version: $PYTORCH_VERSION"\necho "Python Version: $PYTHON_VERSION"\necho "PyTorch CUDA Version: $PYTORCH_CUDA_VERSION"\necho "==============================="' > /usr/local/bin/version-info && \
+    chmod +x /usr/local/bin/version-info
+
+COPY entrypoint.sh /entrypoint.sh
+
+WORKDIR /home/tools/blueglass
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]
